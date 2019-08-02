@@ -3,15 +3,35 @@ const { resolve } = require('probot/lib/resolver')
 const { findPrivateKey } = require('probot/lib/private-key')
 const { template } = require('./views/probot')
 const verify = require('@octokit/webhooks/verify')
+const kms = require('@google-cloud/kms')
 
 let probot
 
-const loadProbot = appFn => {
-  probot = probot || createProbot({
-    id: process.env.APP_ID,
-    secret: process.env.WEBHOOK_SECRET,
-    cert: findPrivateKey()
-  })
+const getOpts = () => ({
+  id: process.env.APP_ID,
+  secret: process.env.WEBHOOK_SECRET,
+  cert: findPrivateKey()
+})
+
+const getOptsKms = async () => {
+  const {
+    APP_ID: id,
+    WEBHOOK_SECRET: encWebhookSecret,
+    PRIVATE_KEY: encPrivateKey,
+    KMS_KEY_ID: keyPath
+  } = process.env
+  const kmsClient = new kms.KeyManagementServiceClient()
+  const [secret, cert] = await Promise.all([encWebhookSecret, encPrivateKey].map(
+    ciphertext => kmsClient.decrypt({
+      name: keyPath,
+      ciphertext
+    }).then(data => data[0].plaintext.toString())
+  ))
+  return {id, secret, cert}
+}
+
+const loadProbot = (opts, appFn) => {
+  probot = probot || createProbot(opts)
 
   if (typeof appFn === 'string') {
     appFn = resolve(appFn)
@@ -22,7 +42,7 @@ const loadProbot = appFn => {
   return probot
 }
 
-module.exports.serverless = appFn => {
+const makeServerless = getOpts => appFn => {
   return async (request, response) => {
     // 🤖 A friendly homepage if there isn't a payload
     if (request.method === 'GET' && request.path === '/probot') {
@@ -34,7 +54,8 @@ module.exports.serverless = appFn => {
     }
 
     // Otherwise let's listen handle the payload
-    probot = probot || loadProbot(appFn)
+    const opts = await getOpts()
+    probot = probot || loadProbot(opts, appFn)
 
     // Determine incoming webhook event type
     const name = request.get('x-github-event') || request.get('X-GitHub-Event')
@@ -42,14 +63,8 @@ module.exports.serverless = appFn => {
     const signature = request.get('x-hub-signature') || request.get('X-Hub-Signature')
 
     const body = request.body
-    console.log(probot.options.secret)
-    console.log(JSON.stringify(body, null, 2))
-    console.log(signature)
     const matchesSignature = verify(probot.options.secret, body, signature)
     if (!matchesSignature) {
-      console.log(probot.options.secret)
-      console.log(JSON.stringify(body, null, 2))
-      console.log(signature)
       console.error('signature does not match event payload and secret')
       response.sendStatus(400)
       return
@@ -80,3 +95,6 @@ module.exports.serverless = appFn => {
     }
   }
 }
+
+module.exports.serverless = makeServerless(getOpts)
+module.exports.serverlessKms = makeServerless(getOptsKms)
